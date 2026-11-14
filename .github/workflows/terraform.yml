@@ -1,0 +1,48 @@
+name: Terraform checks
+
+on:
+  push:
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: terraform
+    env:
+      TF_IN_AUTOMATION: 'true'
+      TF_INPUT: '0'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: '1.17.2'
+          terraform_wrapper: false
+
+      - name: Show Terraform version
+        run: terraform -v
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive -diff
+
+      - name: Initialize AWS provider
+        run: terraform init -backend=false -input=false
+
+      - name: Validate configuration
+        run: terraform validate -no-color
+
+      - name: Test plan and apply with a mocked AWS provider
+        run: terraform test -no-color
