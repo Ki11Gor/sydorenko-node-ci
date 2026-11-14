@@ -131,7 +131,13 @@ jobs:
               ConnectTimeout 15
           EOF
 
-          ssh -F "$ssh_dir/config" ec2-target 'mkdir -p "$HOME/nodeapp-docker"'
+          ssh -F "$ssh_dir/config" ec2-target '
+            set -e
+            if command -v cloud-init >/dev/null 2>&1; then
+              timeout 300 cloud-init status --wait
+            fi
+            mkdir -p "$HOME/nodeapp-docker"
+          '
           scp -F "$ssh_dir/config" docker-compose.yml ec2-target:nodeapp-docker/docker-compose.next.yml
           ssh -F "$ssh_dir/config" ec2-target "bash -se -- '$DOCKERHUB_USERNAME/nodeapp' '$IMAGE_TAG'" <<'REMOTE'
           cd "$HOME/nodeapp-docker"
