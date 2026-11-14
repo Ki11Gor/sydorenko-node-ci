@@ -1,9 +1,10 @@
-name: Node.js CI
+name: Node.js CI/CD
 
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -27,7 +28,27 @@ jobs:
         run: npm run build
 
       - name: Verify build
-        run: test -s dist/index.js && test "$(node dist/index.js)" = 'Hello world'
+        shell: bash
+        run: |
+          test -s dist/index.js
+          test "$(node dist/index.js)" = 'Hello world'
+          output=$(mktemp)
+          node dist/index.js --serve &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; rm -f "$output"' EXIT
+          curl -fs --retry 5 --retry-connrefused --retry-delay 1 --max-time 3 --output "$output" http://127.0.0.1:3000/
+          test "$(cat "$output")" = 'Hello world'
+
+      - name: Verify PM2 start and restart
+        shell: bash
+        run: |
+          npm install --global pm2@7.1.2
+          export PM2_HOME="$RUNNER_TEMP/pm2-test"
+          trap 'pm2 kill >/dev/null 2>&1 || true' EXIT
+          pm2 start dist/index.js --name sydorenko-node-ci -- --serve
+          test "$(curl -fs --retry 5 --retry-connrefused --retry-delay 1 --max-time 3 http://127.0.0.1:3000/)" = 'Hello world'
+          pm2 restart sydorenko-node-ci
+          test "$(curl -fs --retry 5 --retry-connrefused --retry-delay 1 --max-time 3 http://127.0.0.1:3000/)" = 'Hello world'
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
@@ -35,3 +56,94 @@ jobs:
           name: node-build
           path: dist/index.js
           if-no-files-found: error
+
+  deploy:
+    needs: build
+    if: ${{ github.ref == 'refs/heads/main' && vars.EC2_HOST_KEY != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    concurrency:
+      group: deploy-ec2
+      cancel-in-progress: false
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: node-build
+          path: dist
+
+      - name: Prepare EC2 SSH connection
+        shell: bash
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
+          EC2_HOST_KEY: ${{ vars.EC2_HOST_KEY }}
+        run: |
+          : "${EC2_HOST:?Add the EC2_HOST Actions secret}"
+          : "${EC2_USER:?Add the EC2_USER Actions secret}"
+          : "${EC2_SSH_KEY_B64:?Add the EC2_SSH_KEY_B64 Actions secret}"
+
+          if [[ ! "$EC2_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ || ! "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            printf '%s\n' 'Invalid EC2 host or SSH user.' >&2
+            exit 1
+          fi
+
+          read -r key_type key_data _ <<< "$EC2_HOST_KEY"
+          if [[ "$key_type" != ssh-ed25519 || ! "$key_data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; then
+            printf '%s\n' 'EC2_HOST_KEY must contain the server ED25519 public key.' >&2
+            exit 1
+          fi
+
+          umask 077
+          ssh_dir="$RUNNER_TEMP/ec2-ssh"
+          mkdir -p "$ssh_dir"
+          printf '%s' "$EC2_SSH_KEY_B64" | base64 --decode > "$ssh_dir/deploy_key"
+          ssh-keygen -y -f "$ssh_dir/deploy_key" </dev/null >/dev/null
+          printf '%s %s %s\n' "$EC2_HOST" "$key_type" "$key_data" > "$ssh_dir/known_hosts"
+
+          cat > "$ssh_dir/config" <<EOF
+          Host ec2-lab
+              HostName $EC2_HOST
+              User $EC2_USER
+              IdentityFile "$ssh_dir/deploy_key"
+              UserKnownHostsFile "$ssh_dir/known_hosts"
+              StrictHostKeyChecking yes
+              HostKeyAlgorithms ssh-ed25519
+              IdentitiesOnly yes
+              BatchMode yes
+              ConnectTimeout 15
+          EOF
+
+      - name: Copy build to EC2
+        shell: bash
+        run: |
+          ssh_config="$RUNNER_TEMP/ec2-ssh/config"
+          ssh -F "$ssh_config" ec2-lab 'mkdir -p "$HOME/nodeapp/dist"'
+          scp -F "$ssh_config" dist/index.js ec2-lab:nodeapp/dist/index.next.js
+
+      - name: Start and verify app on EC2
+        shell: bash
+        run: |
+          ssh -F "$RUNNER_TEMP/ec2-ssh/config" ec2-lab 'bash -se' <<'REMOTE'
+          cd "$HOME/nodeapp"
+          command -v pm2 >/dev/null
+          test "$(node dist/index.next.js)" = 'Hello world'
+          mv dist/index.next.js dist/index.js
+
+          if pm2 describe sydorenko-node-ci >/dev/null 2>&1; then
+            pm2 restart sydorenko-node-ci
+          else
+            pm2 start dist/index.js --name sydorenko-node-ci -- --serve
+          fi
+
+          response=$(curl -fsS --retry 5 --retry-connrefused --retry-delay 1 --max-time 3 http://127.0.0.1:3000/)
+          test "$response" = 'Hello world'
+          pm2 save
+          printf 'EC2 health check passed: %s\n' "$response"
+          REMOTE
+
+      - name: Remove temporary SSH files
+        if: ${{ always() }}
+        shell: bash
+        run: rm -rf -- "$RUNNER_TEMP/ec2-ssh"
