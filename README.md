@@ -22,7 +22,9 @@ node dist/index.js
 
 За замовчуванням завдання `deploy` створює тимчасовий Linux-контейнер на runner GitHub. Воно завантажує артефакт `node-build`, передає збірку через SSH, запускає її через PM2 та перевіряє HTTP-відповідь. Після перевірки GitHub Actions видаляє контейнер і тимчасові ключі. У цьому режимі GitHub Secrets і платіжна картка не потрібні.
 
-У GitHub відкрий **Actions → Node.js CI/CD → останній запуск → Deploy to Linux container**. У кроці **Prepare SSH target** журнал покаже `Deployment target: temporary Linux container`, а в **Start app and verify HTTP** очікуваний результат — `HTTP health check passed: Hello world`. Для виконання вимоги розгорнути застосунок на Amazon EC2 потрібен доступ до інстанса.
+У запуску №7 GitHub Actions успішно виконав `build` і **Deploy to Linux container**. Крок **Start app and verify HTTP** підтвердив відповідь `HTTP health check passed: Hello world`. [Переглянути успішний запуск](https://github.com/Ki11Gor/sydorenko-node-ci/actions/runs/43611315437)
+
+Щоб перевірити нову збірку, відкрий **Actions → Node.js CI/CD → останній запуск → Deploy to Linux container**. Для розгортання на Amazon EC2 потрібен доступ до інстанса.
 
 ## Підготовка EC2
 
