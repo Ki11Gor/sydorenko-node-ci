@@ -18,6 +18,12 @@ node dist/index.js
 
 Пайплайн `.github/workflows/ci.yml` запускається після `push` до `main`. У GitHub відкрий **Actions → Node.js CI/CD → build**. Кроки `npm install`, `npm run build` і `Verify build` встановлюють залежності, збирають застосунок і перевіряють його в обох режимах. Артефакт `node-build` містить зібраний `index.js`.
 
+## Навчальний деплой без AWS-акаунта
+
+За замовчуванням завдання `deploy` створює тимчасовий Linux-контейнер на runner GitHub. Воно завантажує артефакт `node-build`, передає збірку через SSH, запускає її через PM2 та перевіряє HTTP-відповідь. Після перевірки GitHub Actions видаляє контейнер і тимчасові ключі. У цьому режимі GitHub Secrets і платіжна картка не потрібні.
+
+У GitHub відкрий **Actions → Node.js CI/CD → останній запуск → Deploy to Linux container**. У кроці **Prepare SSH target** журнал покаже `Deployment target: temporary Linux container`, а в **Start app and verify HTTP** очікуваний результат — `HTTP health check passed: Hello world`. Для виконання вимоги розгорнути застосунок на Amazon EC2 потрібен доступ до інстанса.
+
 ## Підготовка EC2
 
 Для запуску потрібні налаштований AWS CLI, дійсний Ubuntu 20.04 AMI, SSH-пара ключів і Security Group у `us-east-1`. У прикладі використано стандартний VPC, `t3.micro` і відповідні йому x86-64 AMI. Перевір умови свого тарифу AWS перед запуском.
@@ -75,7 +81,7 @@ cat /etc/ssh/ssh_host_ed25519_key.pub
 base64 -w 0 devops-key.pem | clip.exe
 ```
 
-У вкладці **Variables** створи `EC2_HOST_KEY` зі значенням публічного ключа сервера з попереднього кроку (`ssh-ed25519 AAAA…`). Ця змінна вмикає завдання `deploy`. Зберігай `.pem` і його копію в Base64 поза репозиторієм.
+У вкладці **Variables** створи `EC2_HOST_KEY` зі значенням публічного ключа сервера з попереднього кроку (`ssh-ed25519 AAAA…`). Ця змінна перемикає ціль завдання `deploy` на EC2. Зберігай `.pem` і його копію в Base64 поза репозиторієм.
 
-Після налаштування виконай новий `push` до `main` або вибери **Actions → Node.js CI/CD → Run workflow → main**. Після збірки завдання `deploy` готує SSH-з’єднання, копіює перевірений артефакт у `~/nodeapp/dist` і запускає або перезапускає застосунок через PM2. Крок `Start and verify app on EC2` покаже `EC2 health check passed: Hello world`, якщо сервер відповів після розгортання.
+Після налаштування виконай новий `push` до `main` або вибери **Actions → Node.js CI/CD → Run workflow → main**. Після збірки завдання `deploy` готує SSH-з’єднання, копіює перевірений артефакт у `~/nodeapp/dist` і запускає або перезапускає застосунок через PM2. У режимі EC2 журнал покаже `Deployment target: Amazon EC2`, а крок **Start app and verify HTTP** підтвердить відповідь `HTTP health check passed: Hello world`.
 
