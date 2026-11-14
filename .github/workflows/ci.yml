@@ -1,0 +1,37 @@
+name: Node.js CI
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify build
+        run: test -s dist/index.js && test "$(node dist/index.js)" = 'Hello world'
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: node-build
+          path: dist/index.js
+          if-no-files-found: error
