@@ -58,12 +58,13 @@ jobs:
           if-no-files-found: error
 
   deploy:
+    name: ${{ vars.EC2_HOST_KEY != '' && 'Deploy to Amazon EC2' || 'Deploy to Linux container' }}
     needs: build
-    if: ${{ github.ref == 'refs/heads/main' && vars.EC2_HOST_KEY != '' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
     concurrency:
-      group: deploy-ec2
+      group: deploy-node-app
       cancel-in-progress: false
     steps:
       - name: Download build artifact
@@ -72,7 +73,7 @@ jobs:
           name: node-build
           path: dist
 
-      - name: Prepare EC2 SSH connection
+      - name: Prepare SSH target
         shell: bash
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
@@ -80,34 +81,76 @@ jobs:
           EC2_SSH_KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
           EC2_HOST_KEY: ${{ vars.EC2_HOST_KEY }}
         run: |
-          : "${EC2_HOST:?Add the EC2_HOST Actions secret}"
-          : "${EC2_USER:?Add the EC2_USER Actions secret}"
-          : "${EC2_SSH_KEY_B64:?Add the EC2_SSH_KEY_B64 Actions secret}"
-
-          if [[ ! "$EC2_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ || ! "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
-            printf '%s\n' 'Invalid EC2 host or SSH user.' >&2
-            exit 1
-          fi
-
-          read -r key_type key_data _ <<< "$EC2_HOST_KEY"
-          if [[ "$key_type" != ssh-ed25519 || ! "$key_data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; then
-            printf '%s\n' 'EC2_HOST_KEY must contain the server ED25519 public key.' >&2
-            exit 1
-          fi
-
           umask 077
-          ssh_dir="$RUNNER_TEMP/ec2-ssh"
+          ssh_dir="$RUNNER_TEMP/deploy-ssh"
           mkdir -p "$ssh_dir"
-          printf '%s' "$EC2_SSH_KEY_B64" | base64 --decode > "$ssh_dir/deploy_key"
+
+          if [[ -n "$EC2_HOST_KEY" ]]; then
+            : "${EC2_HOST:?Add the EC2_HOST Actions secret}"
+            : "${EC2_USER:?Add the EC2_USER Actions secret}"
+            : "${EC2_SSH_KEY_B64:?Add the EC2_SSH_KEY_B64 Actions secret}"
+            if [[ ! "$EC2_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ || ! "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+              printf '%s\n' 'Invalid EC2 host or SSH user.' >&2
+              exit 1
+            fi
+
+            ssh_host="$EC2_HOST"
+            ssh_user="$EC2_USER"
+            ssh_port=22
+            host_key="$EC2_HOST_KEY"
+            printf '%s' "$EC2_SSH_KEY_B64" | base64 --decode > "$ssh_dir/deploy_key"
+            printf '%s\n' 'Deployment target: Amazon EC2'
+          else
+            printf '%s\n' 'Deployment target: temporary Linux container'
+            ssh-keygen -q -t ed25519 -N '' -f "$ssh_dir/deploy_key"
+            ssh-keygen -q -t ed25519 -N '' -f "$ssh_dir/demo_host_key"
+
+            docker build --tag node-ci-ssh-demo - <<'DOCKERFILE'
+          FROM node:24-bookworm-slim
+          RUN apt-get update \
+              && apt-get install -y --no-install-recommends openssh-server curl \
+              && rm -rf /var/lib/apt/lists/* /etc/ssh/ssh_host_*_key* \
+              && npm install --global pm2@7.1.2 \
+              && install -d -m 0755 /run/sshd \
+              && passwd -d node
+          DOCKERFILE
+
+            docker run --detach --rm --name node-ci-ssh-demo \
+              --publish 127.0.0.1::22 \
+              --mount "type=bind,source=$ssh_dir/deploy_key.pub,target=/run/deploy_key.pub,readonly" \
+              --mount "type=bind,source=$ssh_dir/demo_host_key,target=/run/demo_host_key,readonly" \
+              node-ci-ssh-demo bash -ec '
+                install -d -o node -g node -m 0700 /home/node/.ssh
+                install -o node -g node -m 0600 /run/deploy_key.pub /home/node/.ssh/authorized_keys
+                exec /usr/sbin/sshd -D -e -h /run/demo_host_key \
+                  -o UsePAM=no -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+                  -o AuthenticationMethods=publickey -o PermitRootLogin=no \
+                  -o AllowUsers=node -o DisableForwarding=yes
+              '
+
+            ssh_host=127.0.0.1
+            ssh_user=node
+            published_address=$(docker port node-ci-ssh-demo 22/tcp)
+            ssh_port=${published_address##*:}
+            host_key=$(cat "$ssh_dir/demo_host_key.pub")
+          fi
+
+          read -r key_type key_data _ <<< "$host_key"
+          if [[ "$key_type" != ssh-ed25519 || ! "$key_data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; then
+            printf '%s\n' 'Expected an ED25519 server public key.' >&2
+            exit 1
+          fi
           ssh-keygen -y -f "$ssh_dir/deploy_key" </dev/null >/dev/null
-          printf '%s %s %s\n' "$EC2_HOST" "$key_type" "$key_data" > "$ssh_dir/known_hosts"
+          printf 'deploy-target %s %s\n' "$key_type" "$key_data" > "$ssh_dir/known_hosts"
 
           cat > "$ssh_dir/config" <<EOF
-          Host ec2-lab
-              HostName $EC2_HOST
-              User $EC2_USER
+          Host deploy-target
+              HostName $ssh_host
+              Port $ssh_port
+              User $ssh_user
               IdentityFile "$ssh_dir/deploy_key"
               UserKnownHostsFile "$ssh_dir/known_hosts"
+              HostKeyAlias deploy-target
               StrictHostKeyChecking yes
               HostKeyAlgorithms ssh-ed25519
               IdentitiesOnly yes
@@ -115,17 +158,18 @@ jobs:
               ConnectTimeout 15
           EOF
 
-      - name: Copy build to EC2
+      - name: Copy build over SSH
         shell: bash
         run: |
-          ssh_config="$RUNNER_TEMP/ec2-ssh/config"
-          ssh -F "$ssh_config" ec2-lab 'mkdir -p "$HOME/nodeapp/dist"'
-          scp -F "$ssh_config" dist/index.js ec2-lab:nodeapp/dist/index.next.js
+          ssh_config="$RUNNER_TEMP/deploy-ssh/config"
+          ssh -F "$ssh_config" -o ConnectionAttempts=5 deploy-target 'mkdir -p "$HOME/nodeapp/dist"'
+          scp -F "$ssh_config" dist/index.js deploy-target:nodeapp/dist/index.next.js
 
-      - name: Start and verify app on EC2
+      - name: Start app and verify HTTP
         shell: bash
         run: |
-          ssh -F "$RUNNER_TEMP/ec2-ssh/config" ec2-lab 'bash -se' <<'REMOTE'
+          ssh -F "$RUNNER_TEMP/deploy-ssh/config" deploy-target 'bash -se' <<'REMOTE'
+          export PATH="/usr/local/bin:$PATH"
           cd "$HOME/nodeapp"
           command -v pm2 >/dev/null
           test "$(node dist/index.next.js)" = 'Hello world'
@@ -140,10 +184,14 @@ jobs:
           response=$(curl -fsS --retry 5 --retry-connrefused --retry-delay 1 --max-time 3 http://127.0.0.1:3000/)
           test "$response" = 'Hello world'
           pm2 save
-          printf 'EC2 health check passed: %s\n' "$response"
+          printf 'HTTP health check passed: %s\n' "$response"
           REMOTE
+
+      - name: Remove demo container
+        if: ${{ always() && vars.EC2_HOST_KEY == '' }}
+        run: docker rm --force node-ci-ssh-demo >/dev/null 2>&1 || true
 
       - name: Remove temporary SSH files
         if: ${{ always() }}
         shell: bash
-        run: rm -rf -- "$RUNNER_TEMP/ec2-ssh"
+        run: rm -rf -- "$RUNNER_TEMP/deploy-ssh"
