@@ -1,0 +1,155 @@
+name: Docker CI/CD
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      commit_tag: ${{ steps.tags.outputs.commit }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Generate commit and branch tags
+        id: tags
+        shell: bash
+        run: |
+          commit_tag=$(git rev-parse --short=12 HEAD)
+          branch_tag=$(printf '%s' "$GITHUB_REF_NAME" | LC_ALL=C sed -E 's/[^A-Za-z0-9_.-]+/-/g' | cut -c1-100)
+          if [[ "$branch_tag" != "$GITHUB_REF_NAME" ]]; then
+            branch_hash=$(printf '%s' "$GITHUB_REF_NAME" | sha256sum | cut -c1-12)
+            branch_tag="$branch_tag-$branch_hash"
+          fi
+          printf 'commit=%s\nbranch=branch-%s\n' "$commit_tag" "$branch_tag" >> "$GITHUB_OUTPUT"
+          printf 'Image tags: %s and branch-%s\n' "$commit_tag" "$branch_tag"
+
+      - name: Build Docker image
+        env:
+          IMAGE_TAG: ${{ steps.tags.outputs.commit }}
+        run: docker build -t "nodeapp:$IMAGE_TAG" .
+
+      - name: Start Compose and verify PostgreSQL
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.tags.outputs.commit }}
+        run: |
+          POSTGRES_PASSWORD=$(openssl rand -hex 24)
+          export POSTGRES_PASSWORD
+          trap 'docker compose logs --no-color app || true; docker compose down --volumes' EXIT
+          docker compose up -d --no-build --wait --wait-timeout 120
+          docker compose ps
+          test "$(curl -fsS http://127.0.0.1:3000/)" = 'Hello world'
+          test "$(curl -fsS http://127.0.0.1:3000/health)" = 'PostgreSQL connected'
+          printf '%s\n' 'HTTP check passed: Hello world' 'Database check passed: PostgreSQL connected'
+
+      - name: Publish commit and branch tags to Docker Hub
+        if: ${{ startsWith(github.ref, 'refs/heads/') }}
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_TAG: ${{ steps.tags.outputs.commit }}
+          BRANCH_TAG: ${{ steps.tags.outputs.branch }}
+        run: |
+          if [[ -z "$DOCKERHUB_USERNAME" && -z "$DOCKERHUB_TOKEN" ]]; then
+            printf '%s\n' 'Docker Hub publish skipped: configure DOCKERHUB_USERNAME and DOCKERHUB_TOKEN.'
+            exit 0
+          fi
+          : "${DOCKERHUB_USERNAME:?Add the Docker Hub account name}"
+          : "${DOCKERHUB_TOKEN:?Add a Docker Hub access token}"
+          [[ "$DOCKERHUB_USERNAME" =~ ^[a-z0-9]+$ ]]
+          trap 'docker logout >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+          repository="$DOCKERHUB_USERNAME/nodeapp"
+          docker tag "nodeapp:$IMAGE_TAG" "$repository:$IMAGE_TAG"
+          docker tag "nodeapp:$IMAGE_TAG" "$repository:$BRANCH_TAG"
+          docker push "$repository:$IMAGE_TAG"
+          docker push "$repository:$BRANCH_TAG"
+
+  deploy:
+    name: Deploy Compose to Amazon EC2
+    needs: image
+    if: ${{ github.ref == 'refs/heads/main' && vars.EC2_HOST_KEY != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: deploy-node-app
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Deploy the commit image over SSH
+        shell: bash
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY_B64: ${{ secrets.EC2_SSH_KEY_B64 }}
+          EC2_HOST_KEY: ${{ vars.EC2_HOST_KEY }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          IMAGE_TAG: ${{ needs.image.outputs.commit_tag }}
+        run: |
+          : "${EC2_HOST:?Set EC2_HOST}"
+          : "${EC2_USER:?Set EC2_USER}"
+          : "${EC2_SSH_KEY_B64:?Set EC2_SSH_KEY_B64}"
+          : "${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME}"
+          : "${IMAGE_TAG:?Missing commit image tag}"
+          [[ "$EC2_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ && "$EC2_USER" =~ ^[a-z_][a-z0-9_-]*$ && "$DOCKERHUB_USERNAME" =~ ^[a-z0-9]+$ ]]
+          [[ "$IMAGE_TAG" =~ ^[a-f0-9]{12,40}$ ]]
+          read -r key_type key_data _ <<< "$EC2_HOST_KEY"
+          [[ "$key_type" == ssh-ed25519 && "$key_data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]
+
+          umask 077
+          ssh_dir=$(mktemp -d)
+          trap 'rm -rf -- "$ssh_dir"' EXIT
+          printf '%s' "$EC2_SSH_KEY_B64" | base64 --decode > "$ssh_dir/deploy_key"
+          printf 'ec2-target %s %s\n' "$key_type" "$key_data" > "$ssh_dir/known_hosts"
+          cat > "$ssh_dir/config" <<EOF
+          Host ec2-target
+              HostName $EC2_HOST
+              User $EC2_USER
+              IdentityFile "$ssh_dir/deploy_key"
+              UserKnownHostsFile "$ssh_dir/known_hosts"
+              HostKeyAlias ec2-target
+              StrictHostKeyChecking yes
+              HostKeyAlgorithms ssh-ed25519
+              IdentitiesOnly yes
+              BatchMode yes
+              ConnectTimeout 15
+          EOF
+
+          ssh -F "$ssh_dir/config" ec2-target 'mkdir -p "$HOME/nodeapp-docker"'
+          scp -F "$ssh_dir/config" docker-compose.yml ec2-target:nodeapp-docker/docker-compose.next.yml
+          ssh -F "$ssh_dir/config" ec2-target "bash -se -- '$DOCKERHUB_USERNAME/nodeapp' '$IMAGE_TAG'" <<'REMOTE'
+          cd "$HOME/nodeapp-docker"
+          export IMAGE_REPOSITORY="$1" IMAGE_TAG="$2"
+          umask 077
+          if [ ! -s .env ]; then
+            db_password=$(openssl rand -hex 24)
+            printf 'POSTGRES_PASSWORD=%s\n' "$db_password" > .env
+          fi
+
+          docker compose -f docker-compose.next.yml config --quiet
+          docker compose -f docker-compose.next.yml pull
+          docker rm -f nodeapp || true
+          docker compose -f docker-compose.next.yml up -d --no-build --wait --wait-timeout 120
+          test "$(curl -fsS http://127.0.0.1:3000/health)" = 'PostgreSQL connected'
+          sed -E '/^IMAGE_(REPOSITORY|TAG)=/d' .env > .env.next
+          printf '\nIMAGE_REPOSITORY=%s\nIMAGE_TAG=%s\n' "$IMAGE_REPOSITORY" "$IMAGE_TAG" >> .env.next
+          mv .env.next .env
+          mv docker-compose.next.yml docker-compose.yml
+          printf 'EC2 deployment passed for image %s:%s\n' "$IMAGE_REPOSITORY" "$IMAGE_TAG"
+          REMOTE
